@@ -91,6 +91,12 @@ pub(crate) struct Freelist {
 }
 
 impl Freelist {
+    /// Slots have been restored at fixed IDs. Skip minting, which could otherwise
+    /// spend the store's entire acquisition retry budget on already occupied slots.
+    pub(crate) fn finish_restore(&mut self) {
+        *self.next.get_mut() = self.max;
+    }
+
     /// Construct a new [`Freelist`] that manages `max` ids.
     ///
     /// The internal fast recycled list will hold up to `recycled` items.

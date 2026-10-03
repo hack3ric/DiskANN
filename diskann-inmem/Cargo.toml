@@ -8,6 +8,7 @@ license.workspace = true
 edition = "2024"
 
 [dependencies]
+bincode = { workspace = true }
 bytemuck = { workspace = true, features = ["must_cast"] }
 crossbeam-queue = "0.3.12"
 dashmap.workspace = true
@@ -19,13 +20,14 @@ parking_lot = "0.12.5"
 half = { workspace = true }
 hashbrown = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tempfile = { workspace = true }
 
 # Optional
 diskann-quantization = { workspace = true, optional = true, default-features = false }
 
 # Integration Test Dependencies
 diskann-benchmark-runner = { workspace = true, optional = true, features = ["ux-tools"] }
-serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
@@ -51,7 +53,6 @@ diskann-utils = { workspace = true, features = ["testing"] }
 diskann = { workspace = true, features = ["testing"] }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
-tempfile = { workspace = true }
 
 [[bin]]
 name = "integration-test"
@@ -74,7 +75,6 @@ integration-test = [
     "dep:diskann-benchmark-runner",
     "dep:diskann-benchmark-core",
     "dep:tokio",
-    "dep:serde",
     "dep:serde_json",
     "dep:anyhow",
     "dep:rand",

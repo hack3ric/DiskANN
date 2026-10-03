@@ -175,6 +175,11 @@ fn last_queue(epoch: u64) -> usize {
 }
 
 impl Registry {
+    /// Check allocation arithmetic before loading persisted concurrency settings.
+    pub(crate) fn validate_capacity(capacity: NonZeroUsize) -> Result<(), std::alloc::LayoutError> {
+        std::alloc::Layout::array::<GuardSlot>(capacity.get()).map(|_| ())
+    }
+
     /// Return the default number of guard slots.
     pub(crate) const fn default_guard_slots() -> NonZeroUsize {
         DEFAULT_GUARD_SLOTS

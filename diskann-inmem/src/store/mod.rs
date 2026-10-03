@@ -115,7 +115,7 @@ impl Lifecycle {
 }
 
 /// Configuration for the concurrent store.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// The number of epoch guard slots.
     ///
@@ -128,6 +128,10 @@ pub struct Config {
 }
 
 impl Config {
+    pub(crate) fn snapshot_parameters(&self) -> (NonZeroUsize, NonZeroU32) {
+        (self.epoch_guard_slots, self.freelist_recycle_capacity)
+    }
+
     /// Create a new [`Config`] with default concurrency parameters.
     pub fn new() -> Self {
         const DEFAULT_FREELIST_RECYCLE_CAPACITY: NonZeroU32 = NonZeroU32::new(1024).unwrap();
@@ -217,6 +221,8 @@ impl Layout {
 /// A concurrent data and graph store.
 #[derive(Debug)]
 pub(crate) struct Store<T> {
+    // Retain tuning parameters for snapshots; runtime synchronization state is rebuilt.
+    config: Config,
     // The [`slots::Slots`] managed by this [`Store`].
     slots: T,
 
@@ -306,6 +312,7 @@ where
         }
 
         let me = Self {
+            config,
             slots,
             unfrozen: capacity,
             tags,
@@ -318,6 +325,23 @@ where
         };
 
         Ok(me)
+    }
+
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Finish restoring slots at fixed IDs before exposing the store to callers.
+    pub(crate) fn finish_restore(&mut self) {
+        self.freelist.finish_restore();
+        for i in 0..self.unfrozen.value() as u32 {
+            if self.can_read_approximate(i as usize) == Some(false) {
+                // The queue is bounded. Any remaining free slots are found by scanning.
+                if !self.freelist.push(i) {
+                    break;
+                }
+            }
+        }
     }
 
     /// Return the [`slots::Slots`] for this store.

@@ -626,6 +626,7 @@ name = "diskann-inmem"
 version = "0.59.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "bytemuck",
  "crossbeam-queue",
  "dashmap",

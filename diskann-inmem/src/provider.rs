@@ -11,6 +11,8 @@
 //! * Support for concurrent insertions, deletions, and searches.
 //! * Specialized implementations of [`glue::SearchAccessor::expand_beam`] enabling full
 //!   inlining of distance kernels.
+//! * Full-precision snapshots through [`Provider::save`] and [`Provider::load`]. See
+//!   [`crate::persistence`] for the format and exclusive-access requirements.
 //!
 //! Known areas for future work:
 //!
@@ -27,8 +29,8 @@
 //! * Quantization + reranking: The current version of this index targets just a single
 //!   data-store and is planned to be addressed in the near future.
 //!
-//! * Lack of save/load support: The index is currently ephemeral, but there are plans to
-//!   address this gap.
+
+mod persistence;
 
 use std::hash::Hash;
 

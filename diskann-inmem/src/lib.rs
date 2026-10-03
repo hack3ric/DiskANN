@@ -8,6 +8,7 @@
 //! The inmem index for DiskANN.
 
 pub mod num;
+pub mod persistence;
 
 mod buffer;
 mod counters;
