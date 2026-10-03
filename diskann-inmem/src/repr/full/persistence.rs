@@ -17,7 +17,7 @@ use super::{Full, FullPrecision};
 use crate::{
     epoch::Registry,
     num::{Bytes, Capacity, MaxDegree},
-    persistence::{self, Snapshot},
+    persistence::{self, LoadOptions, Snapshot},
     store::{self, Store, intrusive::Intrusive},
 };
 
@@ -79,7 +79,7 @@ impl<T: FullPrecision> Full<T> {
         persistence::save_graph(self.store.neighbors(), writer)
     }
 
-    fn load_full<R: Read>(reader: &mut R, scalar: u32) -> ANNResult<Self> {
+    fn load_full<R: Read>(reader: &mut R, scalar: u32, options: LoadOptions) -> ANNResult<Self> {
         let header: Header = persistence::read(reader)?;
         if header.representation != 1 || header.scalar != scalar {
             return Err(ANNError::message(
@@ -94,7 +94,9 @@ impl<T: FullPrecision> Full<T> {
             _ => return Err(ANNError::message("unsupported snapshot distance metric")),
         };
         let dim = usize::try_from(header.dim)?;
-        let lookahead = NonZeroUsize::new(usize::try_from(header.lookahead)?);
+        let lookahead = options
+            .prefetch
+            .unwrap_or(NonZeroUsize::new(usize::try_from(header.lookahead)?));
         let epoch_guard_slots = NonZeroUsize::new(usize::try_from(header.epoch_guard_slots)?)
             .ok_or_else(|| ANNError::message("snapshot epoch guard slots must be nonzero"))?;
         let freelist_recycle_capacity = NonZeroU32::new(header.freelist_recycle_capacity)
@@ -103,6 +105,22 @@ impl<T: FullPrecision> Full<T> {
             .capacity
             .checked_add(header.frozen)
             .ok_or_else(|| ANNError::message("snapshot slot count overflows u32"))?;
+        let saved_entries = entries;
+        let capacity = options.capacity.unwrap_or(header.capacity);
+        if capacity < header.capacity {
+            return Err(ANNError::message("snapshot capacity cannot shrink"));
+        }
+        let entries = capacity
+            .checked_add(header.frozen)
+            .ok_or_else(|| ANNError::message("snapshot slot count overflows u32"))?;
+        let epoch_guard_slots = options.epoch_guard_slots.unwrap_or(epoch_guard_slots);
+        let remap = |id| {
+            if id >= header.capacity {
+                id + (capacity - header.capacity)
+            } else {
+                id
+            }
+        };
         let overflow = || ANNError::message("snapshot vector or graph allocation overflows");
         let bytes = dim.checked_mul(size_of::<T>()).ok_or_else(overflow)?;
 
@@ -127,12 +145,12 @@ impl<T: FullPrecision> Full<T> {
             .epoch_guard_slots(epoch_guard_slots)
             .freelist_recycle_capacity(freelist_recycle_capacity);
         let layout = store::Layout::new(
-            Capacity::new(header.capacity as usize),
+            Capacity::new(capacity as usize),
             MaxDegree::new(header.max_degree as usize),
             header.frozen,
         );
         let mut store = Store::new(layout, config, Intrusive::config(Bytes::new(bytes)))?;
-        for id in 0..entries {
+        for id in 0..saved_entries {
             let present: bool = persistence::read(reader)?;
             if !present {
                 if id >= header.capacity {
@@ -141,7 +159,7 @@ impl<T: FullPrecision> Full<T> {
                 continue;
             }
             let mut slot = store
-                .slot(id)
+                .slot(remap(id))
                 .ok_or_else(|| ANNError::message("could not restore snapshot slot"))?;
             let data = slot.data().as_mut_slice();
             reader.read_exact(data).context("reading snapshot vector")?;
@@ -154,7 +172,7 @@ impl<T: FullPrecision> Full<T> {
                 slot.publish();
             }
         }
-        persistence::load_graph(store.neighbors(), reader)?;
+        persistence::load_graph(store.neighbors(), reader, header.capacity, saved_entries)?;
         store.finish_restore();
         Ok(Self {
             store,
@@ -196,7 +214,13 @@ macro_rules! impl_snapshot {
             }
 
             fn read_snapshot<R: Read>(reader: &mut R) -> ANNResult<Self> {
-                Self::load_full(reader, $code)
+                Self::load_full(reader, $code, LoadOptions::default())
+            }
+            fn read_snapshot_with_options<R: Read>(
+                reader: &mut R,
+                options: LoadOptions,
+            ) -> ANNResult<Self> {
+                Self::load_full(reader, $code, options)
             }
         }
     };

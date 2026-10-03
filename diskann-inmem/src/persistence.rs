@@ -9,7 +9,10 @@
 //! finish before saving. An index held in an `Arc` must first regain exclusive ownership.
 //! Snapshots preserve capacity, configuration, internal IDs, graph edges, external IDs,
 //! live vectors, and frozen start points. Deleted slots become reusable on load; locks,
-//! epoch state, and event counters are recreated.
+//! epoch state, and event counters are recreated. [`crate::Provider::load_with_options`]
+//! can grow writable capacity and override epoch guard slots or prefetching. Growth
+//! keeps writable IDs unchanged and relocates frozen points and their graph references
+//! above the new capacity. It allocates the destination store once while reading.
 //!
 //! ```
 //! use diskann_inmem::{Provider, repr::Full, num::{Capacity, MaxDegree}};
@@ -52,7 +55,10 @@
 //! the destination only after a successful write, flush, and file sync. Atomic replacement
 //! does not promise directory-entry durability across a power failure.
 
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    num::NonZeroUsize,
+};
 
 use bincode::Options;
 use diskann::{ANNError, ANNResult, graph::AdjacencyList};
@@ -60,10 +66,22 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{neighbors::Neighbors, repr::Representation};
 
+/// Optional runtime overrides when restoring a snapshot. Defaults preserve saved settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoadOptions {
+    /// Writable capacity. May equal or exceed the saved capacity, but never shrink it.
+    pub capacity: Option<u32>,
+    /// Number of simultaneous epoch guards supported by the restored store.
+    pub epoch_guard_slots: Option<NonZeroUsize>,
+    /// Cache prefetch lookahead. `Some(None)` explicitly disables prefetching.
+    pub prefetch: Option<Option<NonZeroUsize>>,
+}
+
 /// Opt-in persistence for a provider's data representation.
 ///
 /// Implementations must tag and validate their payload, preserve internal IDs, capacity,
 /// configuration, frozen points and graph edges, and restore a store ready for updates.
+/// Implementations supporting capacity growth must remap frozen IDs and their edges.
 /// They must validate all graph IDs before installing adjacency lists. Do not persist
 /// raw synchronization objects, pointers, padding, or unpublished vector bytes.
 pub trait Snapshot: Representation + Sized {
@@ -72,6 +90,19 @@ pub trait Snapshot: Representation + Sized {
 
     /// Read exactly one representation payload, rejecting incompatible formats.
     fn read_snapshot<R: Read>(reader: &mut R) -> ANNResult<Self>;
+
+    /// Restore with runtime overrides. Implementations must opt in to overrides.
+    fn read_snapshot_with_options<R: Read>(
+        reader: &mut R,
+        options: LoadOptions,
+    ) -> ANNResult<Self> {
+        if options != LoadOptions::default() {
+            return Err(ANNError::message(
+                "snapshot representation does not support load overrides",
+            ));
+        }
+        Self::read_snapshot(reader)
+    }
 }
 
 // TODO(quantization): Implement Snapshot for repr::Spherical, persisting the trained
@@ -114,9 +145,21 @@ pub(crate) fn save_graph<W: Write>(graph: &Neighbors, writer: &mut W) -> ANNResu
     Ok(())
 }
 
-pub(crate) fn load_graph<R: Read>(graph: &Neighbors, reader: &mut R) -> ANNResult<()> {
+pub(crate) fn load_graph<R: Read>(
+    graph: &Neighbors,
+    reader: &mut R,
+    saved_capacity: u32,
+    saved_entries: u32,
+) -> ANNResult<()> {
+    let remap = |id| {
+        if id >= saved_capacity {
+            id + (graph.entries() - saved_entries)
+        } else {
+            id
+        }
+    };
     let mut neighbors = Vec::new();
-    for id in 0..graph.entries() {
+    for id in 0..saved_entries {
         let len: u32 = read(reader)?;
         if len > graph.max_degree_u32() {
             return Err(ANNError::message(
@@ -126,13 +169,13 @@ pub(crate) fn load_graph<R: Read>(graph: &Neighbors, reader: &mut R) -> ANNResul
         neighbors.clear();
         for _ in 0..len {
             let neighbor: u32 = read(reader)?;
-            if neighbor >= graph.entries() {
+            if neighbor >= saved_entries {
                 return Err(ANNError::message("snapshot neighbor is out of range"));
             }
-            neighbors.push(neighbor);
+            neighbors.push(remap(neighbor));
         }
         // Deleted slots may still be referenced, and order must be preserved.
-        graph.set(id, &neighbors)?;
+        graph.set(remap(id), &neighbors)?;
     }
     Ok(())
 }

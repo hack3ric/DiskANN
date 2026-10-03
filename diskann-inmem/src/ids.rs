@@ -36,6 +36,10 @@ impl<I> IdMap<I>
 where
     I: Hash + Eq,
 {
+    pub(crate) fn len(&self) -> usize {
+        self.forward.len()
+    }
+
     pub(crate) fn new(capacity: Capacity) -> Self {
         let backward = std::iter::repeat_with(|| {
             let shard = std::iter::repeat_with(|| None).take(SHARD_SIZE).collect();

@@ -113,6 +113,21 @@ where
         })
     }
 
+    /// Borrow the representation for read-only inspection.
+    pub fn representation(&self) -> &R {
+        &self.representation
+    }
+
+    /// Number of live external IDs. Concurrent updates may change this count.
+    pub fn len(&self) -> usize {
+        self.mapping.len()
+    }
+
+    /// Whether there are no live external IDs.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Return the maximum number of neighbors that can be stored in the provider's graph.
     pub fn max_degree(&self) -> MaxDegree {
         self.representation.max_degree()

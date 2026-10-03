@@ -79,6 +79,42 @@ where
             let mut again = Vec::new();
             loaded.write_snapshot(&mut again).unwrap();
             assert_eq!(again, bytes);
+
+            let grown = Full::<T>::read_snapshot_with_options(
+                &mut bytes.as_slice(),
+                LoadOptions {
+                    capacity: Some(8),
+                    epoch_guard_slots: NonZeroUsize::new(5),
+                    prefetch: Some(None),
+                },
+            )
+            .unwrap();
+            assert_eq!(grown.capacity(), Capacity::new(8));
+            assert_eq!(grown.store.frozen().len(), 2);
+            assert_eq!(grown.lookahead, None);
+            assert_eq!(grown.store.config().snapshot_parameters().0.get(), 5);
+            assert_eq!(grown.is_readable(deleted_id), Some(false));
+            for id in [first_id, 8, 9] {
+                assert_eq!(
+                    bytemuck::cast_slice::<T, u8>(&grown.get(id).unwrap()),
+                    bytemuck::cast_slice::<T, u8>(values)
+                );
+            }
+            for (id, expected) in [
+                (first_id, vec![9, deleted_id, 8]),
+                (8, vec![first_id]),
+                (deleted_id, vec![9]),
+            ] {
+                grown.store.neighbors().get(id, &mut neighbors).unwrap();
+                assert_eq!(&*neighbors, expected.as_slice());
+            }
+            // All deleted and newly allocated writable slots must be reusable.
+            for _ in 1..8 {
+                let slot = grown.set(values).unwrap();
+                assert!(slot.id() < 8);
+                slot.publish();
+            }
+            assert!(grown.set(values).is_err());
         }
     }
 }
@@ -202,4 +238,34 @@ fn reject_truncation_occupancy_and_invalid_edges() {
 fn vector_payload_is_little_endian() {
     let bytes = sample();
     assert_eq!(&bytes[52..62], &[1, 0, 0, 160, 63, 1, 0, 0, 96, 64]);
+}
+
+#[test]
+fn reject_invalid_growth_and_saved_edges() {
+    let bytes = sample();
+    for capacity in [0, u32::MAX] {
+        assert!(
+            Full::<f32>::read_snapshot_with_options(
+                &mut bytes.as_slice(),
+                LoadOptions {
+                    capacity: Some(capacity),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
+    let mut changed = bytes;
+    // This edge would be valid in the enlarged store, but was invalid when saved.
+    changed[66..70].copy_from_slice(&2u32.to_le_bytes());
+    assert!(
+        Full::<f32>::read_snapshot_with_options(
+            &mut changed.as_slice(),
+            LoadOptions {
+                capacity: Some(8),
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
 }

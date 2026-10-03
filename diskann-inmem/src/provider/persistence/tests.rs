@@ -44,6 +44,12 @@ fn save<M: Id + Serialize>(provider: &mut Provider<Full<f32>, M>) -> Vec<u8> {
 
 #[tokio::test]
 async fn search_and_updates_after_restore() {
+    for capacity in [40, 48] {
+        search_and_updates_at_capacity(capacity).await;
+    }
+}
+
+async fn search_and_updates_at_capacity(capacity: u32) {
     let provider = provider::<u64>(40);
     let config = diskann::graph::config::Builder::new(
         4,
@@ -85,7 +91,16 @@ async fn search_and_updates_after_restore() {
         .await
         .unwrap();
     let bytes = save(&mut index.data_provider);
-    let restored = TestProvider::load(&mut bytes.as_slice()).unwrap();
+    let restored = TestProvider::load_with_options(
+        &mut bytes.as_slice(),
+        persistence::LoadOptions {
+            capacity: Some(capacity),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(restored.len(), 34);
+    assert!(!restored.is_empty());
     for i in 0..35 {
         let external = i * 10 + 1000;
         if external == 1070 {
@@ -111,8 +126,8 @@ async fn search_and_updates_after_restore() {
         before.iter().map(|n| n.as_tuple()).collect::<Vec<_>>(),
         after.iter().map(|n| n.as_tuple()).collect::<Vec<_>>()
     );
-    // Fill all six free slots, including the deleted one.
-    for i in 0..6 {
+    // Fill the deleted slot, unused saved slots, and all additional capacity.
+    for i in 0..u64::from(capacity - 34) {
         restored
             .insert(&Strategy, &Context, &(5000 + i), &[i as f32, 1.5])
             .await

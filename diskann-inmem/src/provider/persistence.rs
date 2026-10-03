@@ -67,6 +67,17 @@ impl<R: Snapshot, M: Id> Provider<R, M> {
     where
         M: DeserializeOwned,
     {
+        Self::load_with_options(reader, persistence::LoadOptions::default())
+    }
+
+    /// Load a snapshot with optional capacity growth and runtime tuning overrides.
+    pub fn load_with_options<S: Read>(
+        reader: &mut S,
+        options: persistence::LoadOptions,
+    ) -> ANNResult<Self>
+    where
+        M: DeserializeOwned,
+    {
         let mut magic = [0; 8];
         reader.read_exact(&mut magic)?;
         if &magic != persistence::MAGIC {
@@ -78,7 +89,8 @@ impl<R: Snapshot, M: Id> Provider<R, M> {
                 "unsupported provider snapshot version {version}"
             )));
         }
-        let representation = R::read_snapshot(reader).context("loading snapshot representation")?;
+        let representation = R::read_snapshot_with_options(reader, options)
+            .context("loading snapshot representation")?;
         let capacity = u32::try_from(representation.capacity().value())?;
         let count: u32 = persistence::read(reader)?;
         let live = (0..capacity)
@@ -149,6 +161,17 @@ impl<R: Snapshot, M: Id> Provider<R, M> {
         M: DeserializeOwned,
     {
         Self::load(&mut BufReader::new(File::open(path)?))
+    }
+
+    /// Load a snapshot file with runtime overrides. See [`Self::load_with_options`].
+    pub fn load_from_file_with_options(
+        path: impl AsRef<Path>,
+        options: persistence::LoadOptions,
+    ) -> ANNResult<Self>
+    where
+        M: DeserializeOwned,
+    {
+        Self::load_with_options(&mut BufReader::new(File::open(path)?), options)
     }
 
     fn validate_snapshot_mapping(&self) -> ANNResult<u32> {
