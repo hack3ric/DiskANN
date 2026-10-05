@@ -54,7 +54,7 @@ fn save(provider: &mut SphericalProvider) -> Vec<u8> {
 
 #[tokio::test]
 async fn search_and_updates_after_restore() {
-    for rerank in [Rerank::None, Rerank::F16] {
+    for rerank in [Rerank::None, Rerank::F16, Rerank::F32] {
         for capacity in [40, 48] {
             search_and_updates_at_capacity(capacity, rerank).await;
         }
@@ -157,7 +157,7 @@ async fn search_and_updates_at_capacity(capacity: u32, rerank: Rerank) {
 
 #[tokio::test]
 async fn stream_and_file_helpers() {
-    for rerank in [Rerank::None, Rerank::F16] {
+    for rerank in [Rerank::None, Rerank::F16, Rerank::F32] {
         let mut original = provider(4, rerank);
         original
             .set_element(&Context, &100, &[1.5, 0.5][..])

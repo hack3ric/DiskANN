@@ -27,7 +27,8 @@ use crate::{
 // encoding. Layout 1 is dense packed codes followed by DataMeta's three u16 words
 // (two f16 bit patterns and bit_sum). No store tags or alignment padding are saved.
 // Header, quantizer blob, capacity+frozen slot records, then graph adjacency lists.
-// Each slot is a bool followed, if present, by compressed bytes and optional dim f16s.
+// Each slot is a bool followed, if present, by compressed bytes and optional reranking
+// values: none (tag 0), dim f16s (tag 1), or dim f32s (tag 2).
 // A change to the packed representation requires a new layout version.
 #[derive(Debug, Serialize, Deserialize)]
 struct Header {
@@ -68,6 +69,7 @@ impl Snapshot for Spherical {
             rerank: match self.reranker {
                 Reranker::None => 0,
                 Reranker::F16(_) => 1,
+                Reranker::F32(_) => 2,
             },
             lookahead: self.lookahead.map_or(0, |v| v.get() as u64),
             epoch_guard_slots: epoch_guard_slots.get() as u64,
@@ -88,12 +90,16 @@ impl Snapshot for Spherical {
                 if let Some(vector) = vector {
                     let (codes, meta) = vector.split_at(vector.len() - size_of::<DataMeta>());
                     writer.write_all(codes)?;
-                    write_words(writer, meta)?;
+                    write_words::<2, _>(writer, meta)?;
                     if let Some(rerank) = &rerank {
                         let vector = rerank.read(id as usize).ok_or_else(|| {
                             ANNError::message("snapshot reranking vector is missing")
                         })?;
-                        write_words(writer, vector)?;
+                        match self.reranker {
+                            Reranker::F16(_) => write_words::<2, _>(writer, vector)?,
+                            Reranker::F32(_) => write_words::<4, _>(writer, vector)?,
+                            Reranker::None => unreachable!("reranking store without reranker"),
+                        }
                     }
                 }
             }
@@ -119,6 +125,7 @@ impl Snapshot for Spherical {
         let rerank = match header.rerank {
             0 => Rerank::None,
             1 => Rerank::F16,
+            2 => Rerank::F32,
             _ => return Err(ANNError::message("unsupported snapshot reranking mode")),
         };
         if !matches!(header.nbits, 1 | 2 | 4 | 8) || header.frozen == 0 {
@@ -171,14 +178,15 @@ impl Snapshot for Spherical {
             .checked_add(1)
             .and_then(|n| n.checked_next_multiple_of(Bytes::CACHELINE.value()))
             .ok_or_else(overflow)?;
-        let rerank_stride = if rerank == Rerank::F16 {
-            full_dim
-                .checked_mul(2)
-                .and_then(|n| n.checked_next_multiple_of(Bytes::CACHELINE.value()))
-                .ok_or_else(overflow)?
-        } else {
-            0
+        let rerank_element_bytes = match rerank {
+            Rerank::None => 0,
+            Rerank::F16 => size_of::<half::f16>(),
+            Rerank::F32 => size_of::<f32>(),
         };
+        let rerank_stride = full_dim
+            .checked_mul(rerank_element_bytes)
+            .and_then(|n| n.checked_next_multiple_of(Bytes::CACHELINE.value()))
+            .ok_or_else(overflow)?;
         let graph_stride = (header.max_degree as usize)
             .checked_add(1)
             .and_then(|n| n.checked_mul(size_of::<u32>()))
@@ -242,13 +250,17 @@ impl Snapshot for Spherical {
             reader
                 .read_exact(data)
                 .context("reading snapshot compressed vector")?;
-            native_words(&mut data[bytes - size_of::<DataMeta>()..]);
+            native_words::<2>(&mut data[bytes - size_of::<DataMeta>()..]);
             if let Some(rerank) = slot.data().second() {
                 let data = rerank.as_mut_slice();
                 reader
                     .read_exact(data)
                     .context("reading snapshot reranking vector")?;
-                native_words(data);
+                match reranker {
+                    Reranker::F16(_) => native_words::<2>(data),
+                    Reranker::F32(_) => native_words::<4>(data),
+                    Reranker::None => unreachable!("reranking store without reranker"),
+                }
             }
             if id >= header.capacity {
                 slot.freeze();
@@ -268,22 +280,24 @@ impl Snapshot for Spherical {
     }
 }
 
-// Metadata and reranking values consist solely of 16-bit words. Preserve all float
-// bits, including signed zero, rather than converting via floating point arithmetic.
-fn write_words<W: Write>(writer: &mut W, data: &[u8]) -> ANNResult<()> {
+// Metadata and f16 reranking use 2-byte words; f32 reranking uses 4-byte words.
+// Preserve all float bits, including signed zero, without floating point arithmetic.
+fn write_words<const N: usize, W: Write>(writer: &mut W, data: &[u8]) -> ANNResult<()> {
     if cfg!(target_endian = "little") {
         writer.write_all(data)?;
     } else {
-        for word in data.as_chunks::<2>().0 {
-            writer.write_all(&u16::from_ne_bytes(*word).to_le_bytes())?;
+        for word in data.as_chunks::<N>().0 {
+            let mut word = *word;
+            word.reverse();
+            writer.write_all(&word)?;
         }
     }
     Ok(())
 }
 
-fn native_words(data: &mut [u8]) {
+fn native_words<const N: usize>(data: &mut [u8]) {
     if cfg!(target_endian = "big") {
-        for word in data.as_chunks_mut::<2>().0 {
+        for word in data.as_chunks_mut::<N>().0 {
             word.reverse();
         }
     }

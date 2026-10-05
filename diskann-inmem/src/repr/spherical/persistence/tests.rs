@@ -88,7 +88,7 @@ fn roundtrip_all_bits_metrics_and_reranking() {
             SupportedMetric::InnerProduct,
             SupportedMetric::Cosine,
         ] {
-            for rerank in [Rerank::None, Rerank::F16] {
+            for rerank in [Rerank::None, Rerank::F16, Rerank::F32] {
                 let mut original = representation(bits, metric, rerank, 4);
                 let first = Set::set(&original, &[1.0, -0.0, 3.25, -2.0, 0.5][..]).unwrap();
                 let id = first.id();
@@ -146,7 +146,7 @@ fn empty_sparse_and_full_occupancy() {
 
 #[test]
 fn growth_relocates_frozen_vectors_and_edges() {
-    for rerank in [Rerank::None, Rerank::F16] {
+    for rerank in [Rerank::None, Rerank::F16, Rerank::F32] {
         let mut original = representation(2, SupportedMetric::InnerProduct, rerank, 4);
         Set::set(&original, &[1.0; 5][..]).unwrap().publish();
         let deleted = Set::set(&original, &[2.0; 5][..]).unwrap();
@@ -231,7 +231,7 @@ fn reject_invalid_headers_quantizers_and_growth() {
     for change in [
         |h: &mut Header| h.representation = 1,
         |h: &mut Header| h.layout = 2,
-        |h: &mut Header| h.rerank = 2,
+        |h: &mut Header| h.rerank = 3,
         |h: &mut Header| h.nbits = 3,
         |h: &mut Header| h.frozen = 0,
         |h: &mut Header| h.capacity = u32::MAX,
@@ -288,7 +288,7 @@ fn reject_invalid_headers_quantizers_and_growth() {
 
 #[test]
 fn reject_truncation_occupancy_and_graph_corruption() {
-    for rerank in [Rerank::None, Rerank::F16] {
+    for rerank in [Rerank::None, Rerank::F16, Rerank::F32] {
         let mut original = representation(4, SupportedMetric::SquaredL2, rerank, 1);
         original.store.neighbors().set(0, &[2]).unwrap();
         let bytes = save(&mut original);
@@ -306,8 +306,12 @@ fn reject_truncation_occupancy_and_graph_corruption() {
         corrupt = bytes.clone();
         corrupt[slots + 1] = 0; // Missing first frozen point.
         assert!(Spherical::read_snapshot(&mut corrupt.as_slice()).is_err());
-        let graph =
-            slots + 1 + 2 * (1 + h.bytes as usize + if rerank == Rerank::F16 { 10 } else { 0 });
+        let rerank_bytes = match rerank {
+            Rerank::None => 0,
+            Rerank::F16 => 10,
+            Rerank::F32 => 20,
+        };
+        let graph = slots + 1 + 2 * (1 + h.bytes as usize + rerank_bytes);
         for (offset, value) in [(0, 4u32), (4, 3u32)] {
             corrupt = bytes.clone();
             corrupt[graph + offset..graph + offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -331,8 +335,118 @@ fn metadata_and_reranking_words_are_little_endian() {
     let words = [0x8000u16, 0x3c00, 0x1234];
     let native: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
     let mut encoded = Vec::new();
-    write_words(&mut encoded, &native).unwrap();
+    write_words::<2, _>(&mut encoded, &native).unwrap();
     assert_eq!(encoded, [0, 128, 0, 60, 52, 18]);
-    native_words(&mut encoded);
+    native_words::<2>(&mut encoded);
     assert_eq!(encoded, native);
+
+    let words = [0x80000000u32, 0x3f800001, 0x12345678];
+    let native: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+    let mut encoded = Vec::new();
+    write_words::<4, _>(&mut encoded, &native).unwrap();
+    assert_eq!(encoded, [0, 0, 0, 128, 1, 0, 128, 63, 120, 86, 52, 18]);
+    native_words::<4>(&mut encoded);
+    assert_eq!(encoded, native);
+}
+
+#[test]
+fn f32_precision_and_reranking_survive_restore() {
+    use crate::{counters::Counters, repr::Search};
+    use diskann::neighbor::Neighbor;
+    use diskann_vector::distance::DistanceProvider;
+
+    let query = [1.0002, -0.0, 3.1252, -2.0003, 0.5001];
+    let data = [
+        [1.0001, -0.0, 3.1253, -2.0001, 0.5002],
+        [1.0003, 0.0, 3.1251, -2.0004, 0.5003],
+    ];
+    for metric in [
+        SupportedMetric::SquaredL2,
+        SupportedMetric::InnerProduct,
+        SupportedMetric::Cosine,
+    ] {
+        let mut original = representation(4, metric, Rerank::F32, 3);
+        let mut ids = Vec::new();
+        for vector in &data {
+            let slot = Set::set(&original, vector.as_slice()).unwrap();
+            ids.push(slot.id());
+            slot.publish();
+        }
+        let deleted = Set::set(&original, &[2.0; 5][..]).unwrap();
+        let deleted_id = deleted.id();
+        deleted.publish();
+        original.retire(deleted_id).unwrap();
+
+        let bytes = save(&mut original);
+        let (h, start) = header(&bytes);
+        assert_eq!(h.rerank, 2);
+        let first_payload = start + h.quantizer_len as usize + 1 + h.bytes as usize;
+        let expected_bytes: Vec<u8> = data[0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(&bytes[first_payload..first_payload + 20], expected_bytes);
+        let loaded = Spherical::read_snapshot(&mut bytes.as_slice()).unwrap();
+
+        let distance = <f32 as DistanceProvider<f32>>::distance_comparer(
+            super::super::convert_metric(metric),
+            Some(query.len()),
+        );
+        let rounded: Vec<f32> = data[0]
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        assert_ne!(data[0].as_slice(), rounded);
+        if metric == SupportedMetric::SquaredL2 {
+            assert_ne!(
+                distance.call(&query, &data[0]),
+                distance.call(&query, &rounded)
+            );
+        }
+        let mut expected: Vec<_> = ids
+            .iter()
+            .zip(&data)
+            .map(|(&id, v)| Neighbor::new(id, distance.call(&query, v)))
+            .collect();
+        expected.sort_unstable_by(diskann::neighbor::ord::fast_distance);
+
+        for repr in [&original, &loaded] {
+            for (&id, vector) in ids.iter().zip(&data) {
+                assert_eq!(
+                    vectors(repr, id).1.unwrap(),
+                    bytemuck::cast_slice::<f32, u8>(vector)
+                );
+            }
+            let counters = Counters::new();
+            let mut accessor = repr.search_accessor(&query, &(), counters.local()).unwrap();
+            let mut candidates: Vec<_> = ids
+                .iter()
+                .chain([&deleted_id])
+                .map(|&id| Neighbor::new(id, -100.0))
+                .collect();
+            accessor
+                .get_post_process()
+                .unwrap()
+                .post_process(&mut candidates)
+                .unwrap();
+            assert_eq!(
+                candidates.iter().map(|n| n.as_tuple()).collect::<Vec<_>>(),
+                expected.iter().map(|n| n.as_tuple()).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn reject_f32_reranking_allocation_overflow() {
+    let bytes = save(&mut representation(
+        4,
+        SupportedMetric::SquaredL2,
+        Rerank::F32,
+        4,
+    ));
+    // The dimension fits in usize, but the f32 payload size does not.
+    let corrupt = with_header(&bytes, |h| h.full_dim = (usize::MAX / 4 + 1) as u64);
+    let err = Spherical::read_snapshot(&mut corrupt.as_slice()).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("snapshot vector or graph allocation overflows")
+    );
 }

@@ -197,6 +197,10 @@ pub enum Rerank {
     /// Use 16-bit floating point numbers to store the higher precision representation.
     /// These will be used automatically during search to rerank candidates.
     F16,
+
+    /// Store the original 32-bit floating point vectors without loss of precision.
+    /// These will be used automatically during search to rerank candidates.
+    F32,
 }
 
 /// Internal representation of [`Rerank`].
@@ -206,6 +210,7 @@ pub enum Rerank {
 enum Reranker {
     None,
     F16(Distance<f32, f16>),
+    F32(Distance<f32, f32>),
 }
 
 fn convert_metric(metric: SupportedMetric) -> diskann_vector::distance::Metric {
@@ -236,11 +241,15 @@ impl Reranker {
 
                 Self::F16(distance)
             }
+            Rerank::F32 => Self::F32(<f32 as DistanceProvider<f32>>::distance_comparer(
+                convert_metric(metric),
+                Some(dim),
+            )),
         };
 
         let config = match &this {
             Self::None => None,
-            Self::F16(_) => Some(Simple::config(this.bytes_for(dim))),
+            Self::F16(_) | Self::F32(_) => Some(Simple::config(this.bytes_for(dim))),
         };
 
         (this, config)
@@ -256,6 +265,10 @@ impl Reranker {
             Self::F16(_) => Bytes::new(
                 dim.checked_mul(2)
                     .expect("f16 is smaller than the f32 in the quantizer"),
+            ),
+            Self::F32(_) => Bytes::new(
+                dim.checked_mul(size_of::<f32>())
+                    .expect("f32 vectors must fit in the quantizer"),
             ),
         }
     }
@@ -285,6 +298,13 @@ impl Reranker {
                     repr::internal::simple::Reranker::new(reader, distance, counters.fork());
                 Some(Box::new(post_process))
             }
+            (Self::F32(distance), Some(simple)) => {
+                let distance = repr::full::QueryDistance::new(Calf::Borrowed(query), *distance);
+                let reader = simple.reader(guard.share());
+                let post_process =
+                    repr::internal::simple::Reranker::new(reader, distance, counters.fork());
+                Some(Box::new(post_process))
+            }
             _ => unreachable!("invalid combination of arguments"),
         }
     }
@@ -304,6 +324,11 @@ impl Reranker {
             (Self::F16(_), Some(exclusive)) => {
                 use diskann_vector::conversion::CastFromSlice;
                 bytemuck::cast_slice_mut::<u8, f16>(exclusive.as_mut_slice()).cast_from_slice(v);
+            }
+            (Self::F32(_), Some(exclusive)) => {
+                exclusive
+                    .as_mut_slice()
+                    .copy_from_slice(bytemuck::cast_slice(v));
             }
             _ => unreachable!("invalid combination of arguments"),
         }
@@ -1167,7 +1192,7 @@ mod tests {
         ];
 
         let bits = [Bits::One, Bits::Two, Bits::Four];
-        let rerank = [Rerank::None, Rerank::F16];
+        let rerank = [Rerank::None, Rerank::F16, Rerank::F32];
 
         for metric in metrics {
             for bits in bits {
