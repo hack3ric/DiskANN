@@ -358,3 +358,6 @@ async fn files_replace_successfully_and_preserve_previous_on_failure() {
     );
     assert!(TestProvider::load_from_file(temp.path().join("missing")).is_err());
 }
+
+#[cfg(feature = "quantization")]
+mod spherical;

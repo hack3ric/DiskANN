@@ -37,6 +37,24 @@
 //! algorithm parameters such as construction alpha and search-list size belong to the
 //! caller and are not part of the provider snapshot.
 //!
+//! Spherical providers use the same API (requires the `quantization` feature):
+//!
+//! ```
+//! # #[cfg(feature = "quantization")]
+//! # fn restore(mut provider: diskann_inmem::Provider<diskann_inmem::repr::Spherical, u64>)
+//! #     -> diskann::ANNResult<()> {
+//! use diskann_inmem::{Provider, repr::Spherical, persistence::LoadOptions};
+//!
+//! let mut bytes = Vec::new();
+//! provider.save(&mut bytes)?;
+//! let restored = Provider::<Spherical, u64>::load_with_options(
+//!     &mut bytes.as_slice(),
+//!     LoadOptions { prefetch: Some(None), ..Default::default() },
+//! )?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Format and compatibility
 //!
 //! Version 1 starts with `DANNIMEM` and a little-endian `u32` version. The representation
@@ -51,7 +69,10 @@
 //! its trained quantizer, compressed vectors, and optional f16 reranking vectors.
 //! Loading restores these values without retraining or recompressing. Spherical payloads
 //! use representation tag 2 and a versioned packed-vector layout; the quantizer uses
-//! the diskann-quantization FlatBuffers format.
+//! the diskann-quantization FlatBuffers format. All supported bit widths (1, 2, 4, 8)
+//! and metrics retain their trained parameters. Reranking mode is restored from the
+//! snapshot; it cannot be changed at load time. Older readers reject spherical payloads,
+//! while full-precision snapshots retain their existing version-1 encoding.
 //! Representation and scalar mismatches are rejected. Loads validate structure and
 //! allocation arithmetic but still require enough memory for the saved capacity.
 //!
