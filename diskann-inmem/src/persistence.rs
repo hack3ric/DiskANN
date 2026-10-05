@@ -46,7 +46,12 @@
 //! loading requires the same external-ID type and serde schema. There is no automatic
 //! schema migration or compatibility with the older DiskANN index files.
 //!
-//! Only [`crate::repr::Full`] over `f32`, `half::f16`, `u8`, and `i8` implements [`Snapshot`].
+//! [`crate::repr::Full`] over `f32`, `half::f16`, `u8`, and `i8` implements [`Snapshot`].
+//! With the `quantization` feature, `repr::Spherical` also supports snapshots, including
+//! its trained quantizer, compressed vectors, and optional f16 reranking vectors.
+//! Loading restores these values without retraining or recompressing. Spherical payloads
+//! use representation tag 2 and a versioned packed-vector layout; the quantizer uses
+//! the diskann-quantization FlatBuffers format.
 //! Representation and scalar mismatches are rejected. Loads validate structure and
 //! allocation arithmetic but still require enough memory for the saved capacity.
 //!
@@ -104,11 +109,6 @@ pub trait Snapshot: Representation + Sized {
         Self::read_snapshot(reader)
     }
 }
-
-// TODO(quantization): Implement Snapshot for repr::Spherical, persisting the trained
-// quantizer via diskann-quantization/flatbuffers, compressed vectors (including frozen
-// points), and optional f16 reranking vectors/configuration. Restore those bytes directly
-// without retraining or recompressing, and validate the compressed layout and bit width.
 
 pub(crate) const MAGIC: &[u8; 8] = b"DANNIMEM";
 pub(crate) const VERSION: u32 = 1;

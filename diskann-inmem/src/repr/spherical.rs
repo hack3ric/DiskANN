@@ -5,6 +5,8 @@
 
 //! A quantized store for RabitQ style compressed vectors.
 
+mod persistence;
+
 use std::num::NonZeroUsize;
 
 use diskann::{ANNError, ANNResult, error::ErrorContext, utils::IntoUsize};

@@ -68,6 +68,7 @@ default = []
 # Enable spherical-quantization
 quantization = [
     "dep:diskann-quantization",
+    "diskann-quantization/flatbuffers",
 ]
 
 # Enable stress test module
