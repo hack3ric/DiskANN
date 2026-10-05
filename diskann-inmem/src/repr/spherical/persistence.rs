@@ -19,7 +19,7 @@ use super::{Rerank, Reranker, Spherical};
 use crate::{
     epoch::Registry,
     num::{Bytes, Capacity, MaxDegree},
-    persistence::{self, Snapshot},
+    persistence::{self, LoadOptions, Snapshot},
     store::{self, Store, cons, intrusive::Intrusive},
 };
 
@@ -103,6 +103,13 @@ impl Snapshot for Spherical {
     }
 
     fn read_snapshot<R: Read>(reader: &mut R) -> ANNResult<Self> {
+        Self::read_snapshot_with_options(reader, LoadOptions::default())
+    }
+
+    fn read_snapshot_with_options<R: Read>(
+        reader: &mut R,
+        options: LoadOptions,
+    ) -> ANNResult<Self> {
         let header: Header = persistence::read(reader)?;
         if header.representation != 2 || header.layout != 1 {
             return Err(ANNError::message(
@@ -133,7 +140,9 @@ impl Snapshot for Spherical {
                 "snapshot compressed vector size mismatch",
             ));
         }
-        let lookahead = NonZeroUsize::new(usize::try_from(header.lookahead)?);
+        let lookahead = options
+            .prefetch
+            .unwrap_or(NonZeroUsize::new(usize::try_from(header.lookahead)?));
         let epoch_guard_slots = NonZeroUsize::new(usize::try_from(header.epoch_guard_slots)?)
             .ok_or_else(|| ANNError::message("snapshot epoch guard slots must be nonzero"))?;
         let freelist_recycle_capacity = NonZeroU32::new(header.freelist_recycle_capacity)
@@ -142,6 +151,22 @@ impl Snapshot for Spherical {
             .capacity
             .checked_add(header.frozen)
             .ok_or_else(|| ANNError::message("snapshot slot count overflows u32"))?;
+        let saved_entries = entries;
+        let capacity = options.capacity.unwrap_or(header.capacity);
+        if capacity < header.capacity {
+            return Err(ANNError::message("snapshot capacity cannot shrink"));
+        }
+        let entries = capacity
+            .checked_add(header.frozen)
+            .ok_or_else(|| ANNError::message("snapshot slot count overflows u32"))?;
+        let epoch_guard_slots = options.epoch_guard_slots.unwrap_or(epoch_guard_slots);
+        let remap = |id| {
+            if id >= header.capacity {
+                id + (capacity - header.capacity)
+            } else {
+                id
+            }
+        };
         let compressed_stride = bytes
             .checked_add(1)
             .and_then(|n| n.checked_next_multiple_of(Bytes::CACHELINE.value()))
@@ -193,7 +218,7 @@ impl Snapshot for Spherical {
             .epoch_guard_slots(epoch_guard_slots)
             .freelist_recycle_capacity(freelist_recycle_capacity);
         let layout = store::Layout::new(
-            Capacity::new(header.capacity as usize),
+            Capacity::new(capacity as usize),
             MaxDegree::new(header.max_degree as usize),
             header.frozen,
         );
@@ -202,7 +227,7 @@ impl Snapshot for Spherical {
             config,
             cons::Config::new(Intrusive::config(Bytes::new(bytes)), rerank_config),
         )?;
-        for id in 0..entries {
+        for id in 0..saved_entries {
             let present: bool = persistence::read(reader)?;
             if !present {
                 if id >= header.capacity {
@@ -211,7 +236,7 @@ impl Snapshot for Spherical {
                 continue;
             }
             let mut slot = store
-                .slot(id)
+                .slot(remap(id))
                 .ok_or_else(|| ANNError::message("could not restore snapshot slot"))?;
             let data = slot.data().first().as_mut_slice();
             reader
@@ -231,7 +256,7 @@ impl Snapshot for Spherical {
                 slot.publish();
             }
         }
-        persistence::load_graph(store.neighbors(), reader, header.capacity, entries)?;
+        persistence::load_graph(store.neighbors(), reader, header.capacity, saved_entries)?;
         store.finish_restore();
         Ok(Self {
             store,
@@ -249,8 +274,8 @@ fn write_words<W: Write>(writer: &mut W, data: &[u8]) -> ANNResult<()> {
     if cfg!(target_endian = "little") {
         writer.write_all(data)?;
     } else {
-        for word in data.chunks_exact(2) {
-            writer.write_all(&u16::from_ne_bytes([word[0], word[1]]).to_le_bytes())?;
+        for word in data.as_chunks::<2>().0 {
+            writer.write_all(&u16::from_ne_bytes(*word).to_le_bytes())?;
         }
     }
     Ok(())
@@ -258,7 +283,7 @@ fn write_words<W: Write>(writer: &mut W, data: &[u8]) -> ANNResult<()> {
 
 fn native_words(data: &mut [u8]) {
     if cfg!(target_endian = "big") {
-        for word in data.chunks_exact_mut(2) {
+        for word in data.as_chunks_mut::<2>().0 {
             word.reverse();
         }
     }
