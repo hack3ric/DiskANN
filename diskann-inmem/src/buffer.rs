@@ -21,7 +21,14 @@ pub(crate) struct Buffer {
     ptr: NonNull<u8>,
     stride: Bytes,
     entries: usize,
-    layout: Layout,
+    allocation: Allocation,
+}
+
+#[derive(Debug)]
+enum Allocation {
+    Heap(Layout),
+    #[cfg(target_os = "linux")]
+    Mapped(usize),
 }
 
 impl Buffer {
@@ -62,8 +69,112 @@ impl Buffer {
             ptr,
             stride: bytes_per_entry,
             entries,
-            layout,
+            allocation: Allocation::Heap(layout),
         })
+    }
+
+    /// Allocate a dedicated anonymous mapping and bind it before first touch.
+    /// Only the graph calls this; vector buffers retain their normal allocator.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_on_node(
+        entries: usize,
+        bytes_per_entry: Bytes,
+        align: Align,
+        node: u32,
+    ) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind};
+
+        // A single-word mask is sufficient for the benchmark's NUMA topology.
+        if node >= libc::c_ulong::BITS {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "NUMA node exceeds single-word mask",
+            ));
+        }
+        let bytes = bytes_per_entry
+            .checked_mul(entries)
+            .ok_or_else(|| Error::other(BufferError))?;
+        Layout::from_size_align(bytes.value(), align.value()).map_err(Error::other)?;
+        // SAFETY: sysconf takes no pointers and has no memory-safety preconditions.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 || align.value() > page_size as usize {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "unsupported mapping alignment",
+            ));
+        }
+        if bytes.is_zero() {
+            return Self::new(entries, bytes_per_entry, align).map_err(Error::other);
+        }
+        let mapped_bytes = bytes
+            .value()
+            .checked_next_multiple_of(page_size as usize)
+            .filter(|&size| size <= isize::MAX as usize)
+            .ok_or_else(|| Error::other(BufferError))?;
+        // SAFETY: Request a fresh, private, zero-filled mapping. No existing mapping
+        // is replaced, and no pages are populated before installing the policy.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapped_bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if raw == libc::MAP_FAILED {
+            return Err(Error::last_os_error());
+        }
+        let Some(ptr) = NonNull::new(raw.cast::<u8>()) else {
+            // SAFETY: mmap succeeded, but a null address cannot back a Rust slice.
+            unsafe { libc::munmap(raw, mapped_bytes) };
+            return Err(Error::other("mmap returned a null address"));
+        };
+        let buffer = Self {
+            ptr,
+            stride: bytes_per_entry,
+            entries,
+            allocation: Allocation::Mapped(mapped_bytes),
+        };
+        let mask: libc::c_ulong = 1 << node;
+        // Linux's mbind ABI subtracts one from maxnode before reading the mask.
+        let maxnode = libc::c_ulong::from(libc::c_ulong::BITS + 1);
+        // SAFETY: The mapping is page-aligned and owned by buffer. mask contains
+        // maxnode - 1 valid bits. No population or migration flags are needed: this
+        // anonymous mapping has never been touched. Drop unmaps it on failure.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_mbind,
+                raw,
+                mapped_bytes,
+                libc::MPOL_BIND | libc::MPOL_F_STATIC_NODES,
+                &mask as *const libc::c_ulong,
+                maxnode,
+                0_u32,
+            )
+        };
+        if result != 0 {
+            return Err(Error::last_os_error());
+        }
+        eprintln!(
+            "event=diskann3_graph_placement numa_node={node} bytes={} mapped_bytes={mapped_bytes} address={raw:p}",
+            bytes.value()
+        );
+        Ok(buffer)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn new_on_node(
+        _entries: usize,
+        _bytes_per_entry: Bytes,
+        _align: Align,
+        _node: u32,
+    ) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "graph NUMA placement requires Linux",
+        ))
     }
 
     /// Return the number of entries in this [`Buffer`].
@@ -122,11 +233,17 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        // If the layout size is zero, there's nothing to do because we hold a dangling pointer.
-        if self.layout.size() != 0 {
-            // SAFETY: This is the same pointer and allocation that was previously returned
-            // from a successful `alloc_zeroed`.
-            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) }
+        match self.allocation {
+            Allocation::Heap(layout) if layout.size() != 0 => {
+                // SAFETY: The pointer and layout came from alloc_zeroed.
+                unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) }
+            }
+            Allocation::Heap(_) => {}
+            #[cfg(target_os = "linux")]
+            Allocation::Mapped(bytes) => {
+                // SAFETY: This is the complete mapping owned exclusively by self.
+                unsafe { libc::munmap(self.ptr.as_ptr().cast(), bytes) };
+            }
         }
     }
 }
@@ -293,6 +410,50 @@ mod tests {
     use super::*;
 
     use std::{sync::Barrier, thread};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_numa_buffer_rejects_invalid_node_and_size() {
+        assert!(Buffer::new_on_node(1, Bytes::new(500), Align::_128, u32::MAX).is_err());
+        assert!(Buffer::new_on_node(usize::MAX, Bytes::new(500), Align::_128, 0).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires mbind/get_mempolicy permission and memory on NUMA node 0"]
+    fn test_numa_buffer_node0_residency() {
+        // Linux UAPI flags from linux/mempolicy.h, not exposed by libc.
+        const MPOL_F_NODE: libc::c_ulong = 1 << 0;
+        const MPOL_F_ADDR: libc::c_ulong = 1 << 1;
+        let buffer = Buffer::new_on_node(32, Bytes::new(500), Align::_128, 0).unwrap();
+        // SAFETY: sysconf takes no pointers.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        assert_eq!((buffer.as_ptr() as usize) % page_size, 0);
+        for i in 0..buffer.len() {
+            // SAFETY: This test exclusively owns the buffer, and each slice is
+            // dropped before accessing another entry.
+            let row = unsafe { buffer.get(i).unwrap().as_mut_slice() };
+            assert!(row.iter().all(|&byte| byte == 0));
+            row.fill(17);
+        }
+        for offset in (0..buffer.len() * buffer.stride.value()).step_by(page_size) {
+            let mut node: libc::c_int = -1;
+            // SAFETY: node is writable; the address is within the live mapping.
+            // Query the physical node of an already written page, without a mask.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_get_mempolicy,
+                    &mut node as *mut libc::c_int,
+                    std::ptr::null_mut::<libc::c_ulong>(),
+                    0 as libc::c_ulong,
+                    buffer.as_ptr().add(offset),
+                    MPOL_F_NODE | MPOL_F_ADDR,
+                )
+            };
+            assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+            assert_eq!(node, 0);
+        }
+    }
 
     #[derive(Debug)]
     struct Ctx {

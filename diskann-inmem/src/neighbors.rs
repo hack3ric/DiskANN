@@ -91,7 +91,23 @@ impl Neighbors {
             );
         }
 
-        let neighbors = Buffer::new(id_limit.as_usize(), bytes, ALIGN)?;
+        // Opt-in benchmark policy; applies to the full capacity, including future
+        // insertions, and is deliberately not persisted in index snapshots.
+        let neighbors = match std::env::var("DISKANN3_GRAPH_NUMA_NODE") {
+            Err(std::env::VarError::NotPresent) => Buffer::new(id_limit.as_usize(), bytes, ALIGN)?,
+            value => {
+                let node = value
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "DISKANN3_GRAPH_NUMA_NODE must be an unsigned NUMA node ID",
+                        )
+                    })?;
+                Buffer::new_on_node(id_limit.as_usize(), bytes, ALIGN, node)?
+            }
+        };
 
         let locks = std::iter::repeat_with(|| RwLock::new(()))
             .take(id_limit.as_usize().div_ceil(LOCK_GRANULARITY))
@@ -251,6 +267,9 @@ pub(crate) enum NeighborsError {
     /// would exceed `isize::MAX`, or if the underlying allocator returns an error.
     #[error("neighbor buffer allocation failed")]
     AllocationFailed(#[from] BufferError),
+
+    #[error("DISKANN3_GRAPH_NUMA_NODE placement failed: {0}")]
+    NumaPlacement(#[from] std::io::Error),
 }
 
 /// Attempted to access a [`Neighbors`] at an out-of-bounds index.
