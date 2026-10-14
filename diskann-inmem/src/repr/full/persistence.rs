@@ -143,7 +143,8 @@ impl<T: FullPrecision> Full<T> {
         let mut config = store::Config::new();
         config
             .epoch_guard_slots(epoch_guard_slots)
-            .freelist_recycle_capacity(freelist_recycle_capacity);
+            .freelist_recycle_capacity(freelist_recycle_capacity)
+            .graph_numa_node(options.graph_numa_node);
         let layout = store::Layout::new(
             Capacity::new(capacity as usize),
             MaxDegree::new(header.max_degree as usize),

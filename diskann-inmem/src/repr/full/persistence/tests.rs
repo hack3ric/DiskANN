@@ -11,6 +11,47 @@ use diskann_utils::views::Matrix;
 use super::*;
 use crate::repr::{Guard, Representation, Set};
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires mbind/get_mempolicy permission and memory on NUMA node 0"]
+fn numa_snapshot_graph_residency() {
+    let mut original = Full::config(
+        Capacity::new(4),
+        MaxDegree::new(3),
+        Metric::L2,
+        Matrix::row_vector(vec![0f32, 0.0].into()),
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    let mut bytes = Vec::new();
+    original.write_snapshot(&mut bytes).unwrap();
+    let mut loaded = Full::<f32>::read_snapshot_with_options(
+        &mut bytes.as_slice(),
+        LoadOptions {
+            graph_numa_node: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut saved = Vec::new();
+    loaded.write_snapshot(&mut saved).unwrap();
+    assert_eq!(saved, bytes, "placement must not be persisted");
+    let grown = Full::<f32>::read_snapshot_with_options(
+        &mut bytes.as_slice(),
+        LoadOptions {
+            capacity: Some(1024),
+            graph_numa_node: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for id in 0..grown.id_limit().value() {
+        grown.store.neighbors().set(id, &[]).unwrap();
+    }
+    grown.store.neighbors().assert_numa_node(0);
+}
+
 fn roundtrip<T: FullPrecision>(values: &[T])
 where
     Full<T>: Snapshot,
@@ -86,6 +127,7 @@ where
                     capacity: Some(8),
                     epoch_guard_slots: NonZeroUsize::new(5),
                     prefetch: Some(None),
+                    ..Default::default()
                 },
             )
             .unwrap();

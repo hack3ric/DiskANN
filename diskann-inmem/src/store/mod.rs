@@ -125,6 +125,8 @@ pub struct Config {
 
     /// The capacity of the fast free list.
     freelist_recycle_capacity: NonZeroU32,
+    /// Runtime-only graph placement, supplied by snapshot load options.
+    graph_numa_node: Option<u32>,
 }
 
 impl Config {
@@ -138,6 +140,7 @@ impl Config {
         Self {
             epoch_guard_slots: Registry::default_guard_slots(),
             freelist_recycle_capacity: DEFAULT_FREELIST_RECYCLE_CAPACITY,
+            graph_numa_node: None,
         }
     }
 
@@ -147,6 +150,11 @@ impl Config {
     /// on the index at the cost of longer scan times for epoch advancement.
     pub fn epoch_guard_slots(&mut self, epoch_guard_slots: NonZeroUsize) -> &mut Self {
         self.epoch_guard_slots = epoch_guard_slots;
+        self
+    }
+
+    pub(crate) fn graph_numa_node(&mut self, node: Option<u32>) -> &mut Self {
+        self.graph_numa_node = node;
         self
     }
 
@@ -176,6 +184,7 @@ impl Config {
         Self {
             epoch_guard_slots,
             freelist_recycle_capacity,
+            graph_numa_node: None,
         }
     }
 }
@@ -280,6 +289,7 @@ where
         let Config {
             epoch_guard_slots,
             freelist_recycle_capacity,
+            graph_numa_node,
         } = config;
 
         let too_many_entries = || StoreError::too_many_entries(capacity, frozen);
@@ -321,7 +331,10 @@ where
             // we do not want it to release frozen IDs.
             freelist: Freelist::new(entries, freelist_recycle_capacity),
             registry,
-            neighbors: Neighbors::new(id_limit, max_degree)?,
+            neighbors: match graph_numa_node {
+                None => Neighbors::new(id_limit, max_degree)?,
+                Some(node) => Neighbors::new_with_numa_node(id_limit, max_degree, Some(node))?,
+            },
         };
 
         Ok(me)

@@ -101,6 +101,10 @@ pub struct LoadOptions {
     pub epoch_guard_slots: Option<NonZeroUsize>,
     /// Cache prefetch lookahead. `Some(None)` explicitly disables prefetching.
     pub prefetch: Option<Option<NonZeroUsize>>,
+    /// Bind the full graph capacity to this NUMA node before first touch.
+    /// None uses ordinary allocation. Vector placement is unaffected; this
+    /// runtime policy is not saved in snapshots. Explicit placement requires Linux.
+    pub graph_numa_node: Option<u32>,
 }
 
 /// Opt-in persistence for a provider's data representation.

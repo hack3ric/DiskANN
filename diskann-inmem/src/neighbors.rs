@@ -72,6 +72,14 @@ impl Neighbors {
     /// (unreachable on 64-bit targets) or the resulting allocation would exceed
     /// `isize::MAX` bytes.
     pub(crate) fn new(id_limit: IdLimit, max_degree: u32) -> Result<Self, NeighborsError> {
+        Self::new_with_numa_node(id_limit, max_degree, None)
+    }
+
+    pub(crate) fn new_with_numa_node(
+        id_limit: IdLimit,
+        max_degree: u32,
+        node: Option<u32>,
+    ) -> Result<Self, NeighborsError> {
         let bytes = max_degree
             .into_usize()
             .checked_add(1)
@@ -93,20 +101,9 @@ impl Neighbors {
 
         // Opt-in benchmark policy; applies to the full capacity, including future
         // insertions, and is deliberately not persisted in index snapshots.
-        let neighbors = match std::env::var("DISKANN3_GRAPH_NUMA_NODE") {
-            Err(std::env::VarError::NotPresent) => Buffer::new(id_limit.as_usize(), bytes, ALIGN)?,
-            value => {
-                let node = value
-                    .ok()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "DISKANN3_GRAPH_NUMA_NODE must be an unsigned NUMA node ID",
-                        )
-                    })?;
-                Buffer::new_on_node(id_limit.as_usize(), bytes, ALIGN, node)?
-            }
+        let neighbors = match node {
+            None => Buffer::new(id_limit.as_usize(), bytes, ALIGN)?,
+            Some(node) => Buffer::new_on_node(id_limit.as_usize(), bytes, ALIGN, node)?,
         };
 
         let locks = std::iter::repeat_with(|| RwLock::new(()))
@@ -135,6 +132,32 @@ impl Neighbors {
     pub(crate) fn entries(&self) -> u32 {
         // Cast is lossless by construction.
         self.neighbors.len() as u32
+    }
+
+    /// Check physical residency after the test has written every graph slot.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn assert_numa_node(&self, expected: u32) {
+        // SAFETY: sysconf takes no pointers.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page_size > 0);
+        let bytes = self.neighbors.len() * self.neighbors.stride().value();
+        for offset in (0..bytes).step_by(page_size as usize) {
+            let mut node: libc::c_int = -1;
+            // SAFETY: node is writable and the queried address belongs to this
+            // live graph buffer. Linux flags 1 | 2 mean MPOL_F_NODE | MPOL_F_ADDR.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_get_mempolicy,
+                    &mut node as *mut libc::c_int,
+                    std::ptr::null_mut::<libc::c_ulong>(),
+                    0 as libc::c_ulong,
+                    self.neighbors.as_ptr().add(offset),
+                    3 as libc::c_ulong,
+                )
+            };
+            assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+            assert_eq!(node as u32, expected);
+        }
     }
 
     /// Copy the contents of adjacency list `i` into `neighbors`.
@@ -268,7 +291,7 @@ pub(crate) enum NeighborsError {
     #[error("neighbor buffer allocation failed")]
     AllocationFailed(#[from] BufferError),
 
-    #[error("DISKANN3_GRAPH_NUMA_NODE placement failed: {0}")]
+    #[error("graph NUMA placement failed: {0}")]
     NumaPlacement(#[from] std::io::Error),
 }
 

@@ -62,6 +62,36 @@ fn save(repr: &mut Spherical) -> Vec<u8> {
     bytes
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires mbind/get_mempolicy permission and memory on NUMA node 0"]
+fn numa_snapshot_graph_residency() {
+    let mut original = representation(2, SupportedMetric::SquaredL2, Rerank::F16, 4);
+    let bytes = save(&mut original);
+    let mut loaded = Spherical::read_snapshot_with_options(
+        &mut bytes.as_slice(),
+        LoadOptions {
+            graph_numa_node: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(save(&mut loaded), bytes, "placement must not be persisted");
+    let grown = Spherical::read_snapshot_with_options(
+        &mut bytes.as_slice(),
+        LoadOptions {
+            capacity: Some(1024),
+            graph_numa_node: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for id in 0..grown.id_limit().value() {
+        grown.store.neighbors().set(id, &[]).unwrap();
+    }
+    grown.store.neighbors().assert_numa_node(0);
+}
+
 fn vectors(repr: &Spherical, id: u32) -> (Vec<u8>, Option<Vec<u8>>) {
     repr.store
         .guard(|slots, guard| {
@@ -167,6 +197,7 @@ fn growth_relocates_frozen_vectors_and_edges() {
                 capacity: Some(8),
                 epoch_guard_slots: NonZeroUsize::new(5),
                 prefetch: Some(None),
+                ..Default::default()
             },
         )
         .unwrap();

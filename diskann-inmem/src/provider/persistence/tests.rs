@@ -45,11 +45,18 @@ fn save<M: Id + Serialize>(provider: &mut Provider<Full<f32>, M>) -> Vec<u8> {
 #[tokio::test]
 async fn search_and_updates_after_restore() {
     for capacity in [40, 48] {
-        search_and_updates_at_capacity(capacity).await;
+        search_and_updates_at_capacity(capacity, None).await;
     }
 }
 
-async fn search_and_updates_at_capacity(capacity: u32) {
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires NUMA binding permission and memory on node 0"]
+async fn numa_search_and_updates_after_restore() {
+    search_and_updates_at_capacity(48, Some(0)).await;
+}
+
+async fn search_and_updates_at_capacity(capacity: u32, graph_numa_node: Option<u32>) {
     let provider = provider::<u64>(40);
     let config = diskann::graph::config::Builder::new(
         4,
@@ -95,6 +102,7 @@ async fn search_and_updates_at_capacity(capacity: u32) {
         &mut bytes.as_slice(),
         persistence::LoadOptions {
             capacity: Some(capacity),
+            graph_numa_node,
             ..Default::default()
         },
     )

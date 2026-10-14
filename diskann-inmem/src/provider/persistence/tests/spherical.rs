@@ -56,12 +56,25 @@ fn save(provider: &mut SphericalProvider) -> Vec<u8> {
 async fn search_and_updates_after_restore() {
     for rerank in [Rerank::None, Rerank::F16, Rerank::F32] {
         for capacity in [40, 48] {
-            search_and_updates_at_capacity(capacity, rerank).await;
+            search_and_updates_at_capacity(capacity, rerank, None).await;
         }
     }
 }
 
-async fn search_and_updates_at_capacity(capacity: u32, rerank: Rerank) {
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires NUMA binding permission and memory on node 0"]
+async fn numa_search_and_updates_after_restore() {
+    for rerank in [Rerank::None, Rerank::F16, Rerank::F32] {
+        search_and_updates_at_capacity(48, rerank, Some(0)).await;
+    }
+}
+
+async fn search_and_updates_at_capacity(
+    capacity: u32,
+    rerank: Rerank,
+    graph_numa_node: Option<u32>,
+) {
     let provider = provider(40, rerank);
     let config = diskann::graph::config::Builder::new(
         4,
@@ -95,6 +108,7 @@ async fn search_and_updates_at_capacity(capacity: u32, rerank: Rerank) {
         &mut bytes.as_slice(),
         persistence::LoadOptions {
             capacity: Some(capacity),
+            graph_numa_node,
             ..Default::default()
         },
     )
