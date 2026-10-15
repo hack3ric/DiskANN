@@ -74,7 +74,6 @@ impl Buffer {
     }
 
     /// Allocate a dedicated anonymous mapping and bind it before first touch.
-    /// Only the graph calls this; vector buffers retain their normal allocator.
     #[cfg(target_os = "linux")]
     pub(crate) fn new_on_node(
         entries: usize,
@@ -157,10 +156,6 @@ impl Buffer {
         if result != 0 {
             return Err(Error::last_os_error());
         }
-        eprintln!(
-            "event=diskann3_graph_placement numa_node={node} bytes={} mapped_bytes={mapped_bytes} address={raw:p}",
-            bytes.value()
-        );
         Ok(buffer)
     }
 
@@ -173,8 +168,31 @@ impl Buffer {
     ) -> std::io::Result<Self> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "graph NUMA placement requires Linux",
+            "NUMA placement requires Linux",
         ))
+    }
+
+    /// Cold vector allocation, with base-page placement granularity.
+    pub(crate) fn new_vector(
+        entries: usize,
+        stride: Bytes,
+        align: Align,
+        cold_node: Option<u32>,
+    ) -> std::io::Result<Self> {
+        let Some(node) = cold_node else {
+            return Self::new(entries, stride, align).map_err(std::io::Error::other);
+        };
+        let buffer = Self::new_on_node(entries, stride, align, node)?;
+        #[cfg(target_os = "linux")]
+        if let Allocation::Mapped(bytes) = buffer.allocation {
+            // SAFETY: The complete mapping is owned by buffer and is not populated yet.
+            if unsafe { libc::madvise(buffer.ptr.as_ptr().cast(), bytes, libc::MADV_NOHUGEPAGE) }
+                != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(buffer)
     }
 
     /// Return the number of entries in this [`Buffer`].
@@ -225,7 +243,14 @@ impl Buffer {
         }
     }
 
-    #[cfg(test)]
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        match self.allocation {
+            Allocation::Heap(layout) => layout.size(),
+            #[cfg(target_os = "linux")]
+            Allocation::Mapped(bytes) => bytes,
+        }
+    }
+
     pub(crate) fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr().cast_const()
     }

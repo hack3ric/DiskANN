@@ -10,7 +10,7 @@ use diskann::utils::IntoUsize;
 use thiserror::Error;
 
 use crate::{
-    buffer::{Buffer, BufferError, RawSlice},
+    buffer::{Buffer, RawSlice},
     epoch,
     num::{Align, Bytes, IdLimit},
     store::{Lifecycle, slots},
@@ -22,12 +22,21 @@ use crate::{
 pub(crate) struct Config {
     /// The number of bytes held in each slot.
     bytes: Bytes,
+    cold_node: Option<u32>,
 }
 
 impl Config {
     /// Create a new [`Config`] for [`Simple`] reserving `bytes` bytes for each slot.
     pub(crate) fn new(bytes: Bytes) -> Self {
-        Self { bytes }
+        Self {
+            bytes,
+            cold_node: None,
+        }
+    }
+
+    pub(crate) fn cold_node(mut self, node: Option<u32>) -> Self {
+        self.cold_node = node;
+        self
     }
 }
 
@@ -40,10 +49,10 @@ impl slots::SlotsConfig for Config {
         handle: epoch::RegistryHandle,
         tags: &tag::Authoritative,
     ) -> Result<Simple, SimpleError> {
-        let Self { bytes } = self;
+        let Self { bytes, cold_node } = self;
 
         // SAFETY: Inherited from caller.
-        unsafe { Simple::new(bytes, handle, tags.read_only()) }
+        unsafe { Simple::new(bytes, handle, tags.read_only(), cold_node) }
     }
 }
 
@@ -84,15 +93,17 @@ impl Simple {
         bytes: Bytes,
         handle: epoch::RegistryHandle,
         tags: tag::ReadOnly,
+        cold_node: Option<u32>,
     ) -> Result<Self, SimpleError> {
         let Some(padded) = bytes.checked_next_multiple_of(Bytes::CACHELINE) else {
             return Err(SimpleError::bytes_overflowed());
         };
 
-        let buffer = match Buffer::new(tags.id_limit().as_usize(), padded, Align::_128) {
-            Ok(buffer) => buffer,
-            Err(err) => return Err(SimpleError::buffer_error(err)),
-        };
+        let buffer =
+            match Buffer::new_vector(tags.id_limit().as_usize(), padded, Align::_128, cold_node) {
+                Ok(buffer) => buffer,
+                Err(err) => return Err(SimpleError::buffer_error(err)),
+            };
 
         Ok(Self {
             buffer,
@@ -105,6 +116,10 @@ impl Simple {
     /// Create the [`Config`] for `Self`.
     pub(crate) fn config(bytes: Bytes) -> Config {
         Config::new(bytes)
+    }
+
+    pub(crate) fn buffer(&self) -> &Buffer {
+        &self.buffer
     }
 
     /// Return the [`IdLimit`] for this store.
@@ -156,7 +171,7 @@ impl SimpleError {
         Self(SimpleErrorInner::BytesOverflowed)
     }
 
-    fn buffer_error(err: BufferError) -> Self {
+    fn buffer_error(err: std::io::Error) -> Self {
         Self(SimpleErrorInner::BufferError(err))
     }
 }
@@ -166,7 +181,7 @@ enum SimpleErrorInner {
     #[error("computation of the bytes per slot overflowed")]
     BytesOverflowed,
     #[error(transparent)]
-    BufferError(BufferError),
+    BufferError(std::io::Error),
 }
 
 impl slots::Slots for Simple {

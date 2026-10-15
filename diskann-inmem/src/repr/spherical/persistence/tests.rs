@@ -481,3 +481,70 @@ fn reject_f32_reranking_allocation_overflow() {
             .contains("snapshot vector or graph allocation overflows")
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires memory on nodes 0/1 and mbind/move_pages permission"]
+fn numa_vector_budget_residency() {
+    for bits in [1, 2, 4, 8] {
+        for rerank in [Rerank::None, Rerank::F16, Rerank::F32] {
+            let mut original = representation(bits, SupportedMetric::SquaredL2, rerank, 8);
+            let values = [1.0_f32, 2.0, 3.0, 4.0, 5.0];
+            for _ in 0..3 {
+                Set::set(&original, values.as_slice()).unwrap().publish();
+            }
+            original.retire(1).unwrap();
+            let bytes = save(&mut original);
+            for budget in [0, 4096, u64::MAX] {
+                let mut loaded = Spherical::read_snapshot_with_options(
+                    &mut bytes.as_slice(),
+                    LoadOptions {
+                        capacity: Some(4096),
+                        graph_numa_node: Some(0),
+                        vector_placement: Some(crate::placement::VectorPlacementOptions {
+                            budget_bytes: budget,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let assert_residency = |loaded: &Spherical| {
+                    let slots = loaded.store.slots();
+                    let mut arenas = vec![slots.first().buffer()];
+                    if let Some(rerank) = slots.second().slots() {
+                        arenas.push(rerank.buffer());
+                    }
+                    loaded.store.assert_vector_residency(&arenas);
+                    let r = loaded.vector_placement_report().unwrap().unwrap();
+                    assert_eq!(
+                        r.target_dram_bytes,
+                        (budget / r.page_bytes * r.page_bytes).min(r.active_page_bytes)
+                    );
+                    assert_eq!(
+                        r.target_dram_bytes,
+                        r.primary_dram_bytes + r.rerank_dram_bytes
+                    );
+                };
+                assert_residency(&loaded);
+                let mut ordinary = Spherical::read_snapshot_with_options(
+                    &mut bytes.as_slice(),
+                    LoadOptions {
+                        capacity: Some(4096),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(save(&mut loaded), save(&mut ordinary));
+                for _ in 0..80 {
+                    Set::set(&loaded, values.as_slice()).unwrap().publish();
+                }
+                loaded.rebalance_vector_placement().unwrap();
+                assert_residency(&loaded);
+                loaded.retire(0).unwrap();
+                loaded.rebalance_vector_placement().unwrap();
+                assert_residency(&loaded);
+            }
+        }
+    }
+}

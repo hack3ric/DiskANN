@@ -105,6 +105,9 @@ pub struct LoadOptions {
     /// None uses ordinary allocation. Vector placement is unaffected; this
     /// runtime policy is not saved in snapshots. Explicit placement requires Linux.
     pub graph_numa_node: Option<u32>,
+    /// Runtime-only, shared DRAM budget for live vector-storage pages.
+    /// Explicit placement requires Linux and disables THP on vector mappings.
+    pub vector_placement: Option<crate::placement::VectorPlacementOptions>,
 }
 
 /// Opt-in persistence for a provider's data representation.

@@ -42,7 +42,7 @@ use diskann::utils::IntoUsize;
 use thiserror::Error;
 
 use crate::{
-    buffer::{Buffer, BufferError, RawSlice},
+    buffer::{Buffer, RawSlice},
     epoch,
     num::{Align, Bytes, IdLimit},
     store::{Lifecycle, slots},
@@ -54,12 +54,21 @@ use crate::{
 pub(crate) struct Config {
     /// The number of bytes held in each slot.
     bytes: Bytes,
+    cold_node: Option<u32>,
 }
 
 impl Config {
     /// Create a new [`Config`] for [`Intrusive`] reserving `bytes` bytes for each slot.
     pub(crate) fn new(bytes: Bytes) -> Self {
-        Self { bytes }
+        Self {
+            bytes,
+            cold_node: None,
+        }
+    }
+
+    pub(crate) fn cold_node(mut self, node: Option<u32>) -> Self {
+        self.cold_node = node;
+        self
     }
 }
 
@@ -72,10 +81,10 @@ impl slots::SlotsConfig for Config {
         handle: epoch::RegistryHandle,
         tags: &tag::Authoritative,
     ) -> Result<Intrusive, IntrusiveError> {
-        let Self { bytes } = self;
+        let Self { bytes, cold_node } = self;
 
         // SAFETY: Inherited from caller.
-        unsafe { Intrusive::new(bytes, handle, tags.id_limit()) }
+        unsafe { Intrusive::new(bytes, handle, tags.id_limit(), cold_node) }
     }
 }
 
@@ -111,6 +120,7 @@ impl Intrusive {
         bytes: Bytes,
         handle: epoch::RegistryHandle,
         id_limit: IdLimit,
+        cold_node: Option<u32>,
     ) -> Result<Self, IntrusiveError> {
         let Some(unpadded) = bytes.checked_add(AtomicTag::SIZE) else {
             return Err(IntrusiveError::bytes_overflowed());
@@ -119,16 +129,21 @@ impl Intrusive {
             return Err(IntrusiveError::bytes_overflowed());
         };
 
-        let buffer = match Buffer::new(id_limit.as_usize(), padded_bytes, Align::_128) {
-            Ok(buffer) => buffer,
-            Err(err) => return Err(IntrusiveError::buffer_error(err)),
-        };
+        let buffer =
+            match Buffer::new_vector(id_limit.as_usize(), padded_bytes, Align::_128, cold_node) {
+                Ok(buffer) => buffer,
+                Err(err) => return Err(IntrusiveError::buffer_error(err)),
+            };
 
         Ok(Self {
             buffer,
             unpadded,
             handle,
         })
+    }
+
+    pub(crate) fn buffer(&self) -> &Buffer {
+        &self.buffer
     }
 
     /// Return the [`IdLimit`] for this store.
@@ -199,7 +214,7 @@ impl IntrusiveError {
         Self(IntrusiveErrorInner::BytesOverflowed)
     }
 
-    fn buffer_error(err: BufferError) -> Self {
+    fn buffer_error(err: std::io::Error) -> Self {
         Self(IntrusiveErrorInner::BufferError(err))
     }
 }
@@ -209,7 +224,7 @@ enum IntrusiveErrorInner {
     #[error("computation of the bytes per slot overflowed")]
     BytesOverflowed,
     #[error(transparent)]
-    BufferError(BufferError),
+    BufferError(std::io::Error),
 }
 
 impl slots::Slots for Intrusive {

@@ -9,6 +9,7 @@
 
 pub mod num;
 pub mod persistence;
+pub mod placement;
 
 mod buffer;
 mod counters;

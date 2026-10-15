@@ -144,13 +144,19 @@ impl<T: FullPrecision> Full<T> {
         config
             .epoch_guard_slots(epoch_guard_slots)
             .freelist_recycle_capacity(freelist_recycle_capacity)
-            .graph_numa_node(options.graph_numa_node);
+            .graph_numa_node(options.graph_numa_node)
+            .vector_placement(options.vector_placement);
+        let cold_node = options.vector_placement.map(|p| p.cxl_node);
         let layout = store::Layout::new(
             Capacity::new(capacity as usize),
             MaxDegree::new(header.max_degree as usize),
             header.frozen,
         );
-        let mut store = Store::new(layout, config, Intrusive::config(Bytes::new(bytes)))?;
+        let mut store = Store::new(
+            layout,
+            config,
+            Intrusive::config(Bytes::new(bytes)).cold_node(cold_node),
+        )?;
         for id in 0..saved_entries {
             let present: bool = persistence::read(reader)?;
             if !present {
@@ -175,12 +181,14 @@ impl<T: FullPrecision> Full<T> {
         }
         persistence::load_graph(store.neighbors(), reader, header.capacity, saved_entries)?;
         store.finish_restore();
-        Ok(Self {
+        let restored = Self {
             store,
             metric,
             lookahead,
             _type: PhantomData,
-        })
+        };
+        restored.rebalance_vector_placement()?;
+        Ok(restored)
     }
 }
 

@@ -348,6 +348,31 @@ pub struct Spherical {
 }
 
 impl Spherical {
+    /// Rebalance the runtime vector-page budget. Requires a quiescent index:
+    /// no concurrent searches, inserts, deletes, or snapshot operations.
+    /// The caller supplies this boundary; index operations have no added bookkeeping.
+    pub fn rebalance_vector_placement(
+        &self,
+    ) -> std::io::Result<Option<crate::placement::PlacementReport>> {
+        {
+            let slots = self.store.slots();
+            let primary = slots.first().buffer();
+            match slots.second().slots() {
+                Some(rerank) => self
+                    .store
+                    .rebalance_vector_placement(&[primary, rerank.buffer()]),
+                None => self.store.rebalance_vector_placement(&[primary]),
+            }
+        }
+    }
+
+    /// Return the last successful placement report, or an error after migration failure.
+    pub fn vector_placement_report(
+        &self,
+    ) -> std::io::Result<Option<crate::placement::PlacementReport>> {
+        self.store.vector_placement_report()
+    }
+
     /// Initialize a [`Config`] for this representation.
     ///
     /// See also: [`Config::new`].

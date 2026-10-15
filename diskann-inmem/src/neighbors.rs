@@ -105,6 +105,14 @@ impl Neighbors {
             None => Buffer::new(id_limit.as_usize(), bytes, ALIGN)?,
             Some(node) => Buffer::new_on_node(id_limit.as_usize(), bytes, ALIGN, node)?,
         };
+        if let Some(node) = node {
+            eprintln!(
+                "event=diskann3_graph_placement numa_node={node} bytes={} mapped_bytes={} address={:p}",
+                neighbors.len() * neighbors.stride().value(),
+                neighbors.allocated_bytes(),
+                neighbors.as_ptr()
+            );
+        }
 
         let locks = std::iter::repeat_with(|| RwLock::new(()))
             .take(id_limit.as_usize().div_ceil(LOCK_GRANULARITY))

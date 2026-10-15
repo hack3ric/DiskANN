@@ -127,6 +127,7 @@ pub struct Config {
     freelist_recycle_capacity: NonZeroU32,
     /// Runtime-only graph placement, supplied by snapshot load options.
     graph_numa_node: Option<u32>,
+    vector_placement: Option<crate::placement::VectorPlacementOptions>,
 }
 
 impl Config {
@@ -141,6 +142,7 @@ impl Config {
             epoch_guard_slots: Registry::default_guard_slots(),
             freelist_recycle_capacity: DEFAULT_FREELIST_RECYCLE_CAPACITY,
             graph_numa_node: None,
+            vector_placement: None,
         }
     }
 
@@ -155,6 +157,14 @@ impl Config {
 
     pub(crate) fn graph_numa_node(&mut self, node: Option<u32>) -> &mut Self {
         self.graph_numa_node = node;
+        self
+    }
+
+    pub(crate) fn vector_placement(
+        &mut self,
+        options: Option<crate::placement::VectorPlacementOptions>,
+    ) -> &mut Self {
+        self.vector_placement = options;
         self
     }
 
@@ -185,6 +195,7 @@ impl Config {
             epoch_guard_slots,
             freelist_recycle_capacity,
             graph_numa_node: None,
+            vector_placement: None,
         }
     }
 }
@@ -249,6 +260,7 @@ pub(crate) struct Store<T> {
 
     // Graph.
     neighbors: Neighbors,
+    placement: Option<parking_lot::Mutex<crate::placement::Controller>>,
 }
 
 // TODO: This is a guess and probably needs tuning.
@@ -290,7 +302,13 @@ where
             epoch_guard_slots,
             freelist_recycle_capacity,
             graph_numa_node,
+            vector_placement,
         } = config;
+        let placement = vector_placement
+            .map(crate::placement::Controller::new)
+            .transpose()
+            .map_err(|error| StoreError(StoreErrorInner::VectorPlacement(error)))?
+            .map(parking_lot::Mutex::new);
 
         let too_many_entries = || StoreError::too_many_entries(capacity, frozen);
 
@@ -322,6 +340,7 @@ where
         }
 
         let me = Self {
+            placement,
             config,
             slots,
             unfrozen: capacity,
@@ -631,6 +650,42 @@ where
         }
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn assert_vector_residency(&self, arenas: &[&crate::buffer::Buffer]) {
+        self.placement
+            .as_ref()
+            .unwrap()
+            .lock()
+            .assert_residency(arenas);
+    }
+
+    // Caller must quiesce index operations before maintenance. No hot-path hooks.
+    pub(crate) fn rebalance_vector_placement(
+        &self,
+        arenas: &[&crate::buffer::Buffer],
+    ) -> std::io::Result<Option<crate::placement::PlacementReport>> {
+        self.placement
+            .as_ref()
+            .map(|controller| {
+                let readable = (0..self.id_limit().as_usize()).filter(|&i| {
+                    self.tags
+                        .get(i)
+                        .is_some_and(|tag| tag.load(Ordering::Acquire).can_read())
+                });
+                controller.lock().rebalance(arenas, readable)
+            })
+            .transpose()
+    }
+
+    pub(crate) fn vector_placement_report(
+        &self,
+    ) -> std::io::Result<Option<crate::placement::PlacementReport>> {
+        self.placement
+            .as_ref()
+            .map(|controller| controller.lock().report())
+            .transpose()
+    }
+
     /// Return whether or not it is probably okay to read from the slot `i`.
     ///
     /// This check is approximate and non-synchronizing. A full check requires the
@@ -709,8 +764,10 @@ enum StoreErrorInner {
     BufferError(#[from] BufferError),
     #[error(transparent)]
     NeighborsError(#[from] NeighborsError),
-    #[error("error creating slots")]
-    SlotsError(ANNError),
+    #[error("error creating slots: {0}")]
+    SlotsError(#[source] ANNError),
+    #[error("vector placement initialization failed: {0}")]
+    VectorPlacement(#[source] std::io::Error),
     #[error("requested {} but the slots returned {}", expected, got)]
     InvalidConstruction { got: IdLimit, expected: IdLimit },
 }

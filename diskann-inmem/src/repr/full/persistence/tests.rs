@@ -311,3 +311,80 @@ fn reject_invalid_growth_and_saved_edges() {
         .is_err()
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires memory on nodes 0/1 and mbind/move_pages permission"]
+fn numa_vector_budget_residency() {
+    for budget in [0, 4095, 8193, u64::MAX] {
+        let values = vec![1.0_f32; 4096];
+        let mut original = Full::config(
+            Capacity::new(8),
+            MaxDegree::new(3),
+            Metric::L2,
+            Matrix::row_vector(values.clone().into()),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        original.set(values.as_slice()).unwrap().publish();
+        let deleted = original.set(values.as_slice()).unwrap();
+        let deleted_id = deleted.id();
+        deleted.publish();
+        original.set(values.as_slice()).unwrap().publish();
+        original.retire(deleted_id).unwrap();
+        let mut bytes = Vec::new();
+        original.write_snapshot(&mut bytes).unwrap();
+        let options = LoadOptions {
+            capacity: Some(4096), // Frozen medoid moves past a large unpopulated gap.
+            graph_numa_node: Some(0),
+            vector_placement: Some(crate::placement::VectorPlacementOptions {
+                budget_bytes: budget,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut loaded =
+            Full::<f32>::read_snapshot_with_options(&mut bytes.as_slice(), options).unwrap();
+        loaded
+            .store
+            .assert_vector_residency(&[loaded.store.slots().buffer()]);
+        let report = loaded.vector_placement_report().unwrap().unwrap();
+        assert_eq!(report.active_bytes, 3 * (4096 * 4 + 64));
+        assert_eq!(
+            report.target_dram_bytes,
+            (budget / report.page_bytes * report.page_bytes).min(report.active_page_bytes)
+        );
+        // Placement is not serialized. Compare against ordinary loading at the same capacity.
+        let mut ordinary = Full::<f32>::read_snapshot_with_options(
+            &mut bytes.as_slice(),
+            LoadOptions {
+                capacity: options.capacity,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut placed_bytes = Vec::new();
+        let mut ordinary_bytes = Vec::new();
+        loaded.write_snapshot(&mut placed_bytes).unwrap();
+        ordinary.write_snapshot(&mut ordinary_bytes).unwrap();
+        assert_eq!(placed_bytes, ordinary_bytes);
+        for _ in 0..80 {
+            loaded.set(values.as_slice()).unwrap().publish();
+        }
+        loaded.rebalance_vector_placement().unwrap();
+        loaded
+            .store
+            .assert_vector_residency(&[loaded.store.slots().buffer()]);
+        loaded.retire(0).unwrap();
+        loaded.rebalance_vector_placement().unwrap();
+        loaded
+            .store
+            .assert_vector_residency(&[loaded.store.slots().buffer()]);
+        loaded.set(values.as_slice()).unwrap().publish();
+        loaded.rebalance_vector_placement().unwrap();
+        loaded
+            .store
+            .assert_vector_residency(&[loaded.store.slots().buffer()]);
+    }
+}
