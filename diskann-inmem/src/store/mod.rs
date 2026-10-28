@@ -155,12 +155,14 @@ impl Config {
         self
     }
 
-    pub(crate) fn graph_numa_node(&mut self, node: Option<u32>) -> &mut Self {
+    /// Bind graph storage to a NUMA node; `None` uses ordinary allocation.
+    pub fn graph_numa_node(&mut self, node: Option<u32>) -> &mut Self {
         self.graph_numa_node = node;
         self
     }
 
-    pub(crate) fn vector_placement(
+    /// Set the placement policy for live vector pages.
+    pub fn vector_placement(
         &mut self,
         options: Option<crate::placement::VectorPlacementOptions>,
     ) -> &mut Self {
